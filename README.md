@@ -1,6 +1,6 @@
 # AWS What's New Summary Tool
 
-Automatically fetches the [AWS What's New](https://aws.amazon.com/about-aws/whats-new/recent/) RSS feed, summarises new announcements using Amazon Bedrock, and emails a clean daily digest to your inbox — formatted for easy sharing on LinkedIn or Microsoft Teams.
+Automatically fetches the [AWS What's New](https://aws.amazon.com/about-aws/whats-new/recent/) RSS feed, summarises new announcements using Amazon Bedrock Nova Lite, and emails a clean daily digest to your inbox — formatted for easy sharing on LinkedIn or Microsoft Teams.
 
 ---
 
@@ -26,7 +26,7 @@ Automatically fetches the [AWS What's New](https://aws.amazon.com/about-aws/what
 3. Each announcement is checked against a **DynamoDB table** — items already processed in a previous run are skipped, ensuring no duplicate emails.
 4. New announcements are sent to **Amazon Bedrock (Nova Lite)** for a concise 2–3 sentence summary.
 5. **Amazon SES** sends a formatted HTML email listing every new announcement with its summary and a direct link to the announcement page.
-6. Processed item GUIDs are recorded in DynamoDB to prevent reprocessing on the next run.
+6. Processed item GUIDs are written back to DynamoDB to prevent reprocessing on the next run.
 
 ---
 
@@ -54,8 +54,8 @@ EventBridge Scheduler (daily, 03:00 AEST)
 | Amazon DynamoDB (on-demand) | Deduplication tracking |
 | Amazon Bedrock — Nova Lite | AI summarisation |
 | Amazon SES | Email delivery |
-| Amazon S3 | Lambda deployment package storage |
-| AWS CloudFormation | Infrastructure as code |
+| Amazon S3 (CDK bootstrap bucket) | Lambda deployment package |
+| AWS CloudFormation (via CDK) | Infrastructure as code |
 | Amazon CloudWatch Logs | Lambda execution logs (30-day retention) |
 
 **Region:** `ap-southeast-2` (Sydney)
@@ -102,7 +102,7 @@ All estimates assume **20 new announcements per day** in `ap-southeast-2`. Price
 | Price | $0.10 / 1,000 emails |
 | **Monthly cost** | **< $0.01** |
 
-### S3 (deployment package)
+### S3 (CDK bootstrap bucket)
 
 | Metric | Value |
 |---|---|
@@ -130,15 +130,23 @@ All estimates assume **20 new announcements per day** in `ap-southeast-2`. Price
 ## Prerequisites
 
 1. **AWS account** with an SSO profile configured locally (`mymlpg`).
-2. **S3 bucket** in `ap-southeast-2` to stage the Lambda deployment package:
+2. **CDK bootstrapped** in `ap-southeast-2` (one-time per account/region):
    ```bash
-   aws s3 mb s3://YOUR-DEPLOYMENT-BUCKET --region ap-southeast-2 --profile mymlpg
+   cdk bootstrap aws://YOUR-ACCOUNT-ID/ap-southeast-2 --profile mymlpg
    ```
-3. **Bedrock Nova Lite access** — enable the model in your account:
-   - Open the [Bedrock Model Access console](https://ap-southeast-2.console.aws.amazon.com/bedrock/home?region=ap-southeast-2#/modelaccess)
-   - Request access for **Amazon Nova Lite** (approval is usually instant).
-4. **Python 3** and **pip** installed locally.
-5. **Git** installed locally.
+3. **SES email verification** — verify your recipient address before the first run:
+   ```bash
+   aws ses verify-email-identity \
+     --email-address gluxford@gmail.com \
+     --region ap-southeast-2 \
+     --profile mymlpg
+   ```
+   Then click the confirmation link in the email AWS sends you.
+4. **Docker** installed and running (CDK uses it to bundle the Lambda package).
+5. **Python 3** and **CDK CLI** installed locally:
+   ```bash
+   npm install -g aws-cdk
+   ```
 
 ---
 
@@ -151,45 +159,43 @@ git clone git@github.com:gluxford/aws-whats-new-summary-tool.git
 cd aws-whats-new-summary-tool
 ```
 
-### Step 2 — Package and upload the Lambda function
+### Step 2 — Set up the Python environment
 
 ```bash
-chmod +x scripts/package.sh
-./scripts/package.sh YOUR-DEPLOYMENT-BUCKET mymlpg
+cd cdk
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
 ```
 
-This installs Python dependencies, zips the Lambda code, and uploads the package to your S3 bucket.
-
-### Step 3 — Deploy the CloudFormation stack
+### Step 3 — Synthesise (validate before deploying)
 
 ```bash
-aws cloudformation deploy \
-  --template-file cloudformation/template.yaml \
-  --stack-name aws-whats-new-summary-tool \
-  --capabilities CAPABILITY_NAMED_IAM \
+cdk synth --profile mymlpg
+```
+
+This generates the CloudFormation template locally without touching AWS. Review the output for any issues.
+
+### Step 4 — Deploy
+
+```bash
+cdk deploy --profile mymlpg
+```
+
+CDK will show you a resource summary and prompt for confirmation before deploying.
+
+### Step 5 — Verify your email address
+
+If not already done, verify your recipient address:
+
+```bash
+aws ses verify-email-identity \
+  --email-address gluxford@gmail.com \
   --region ap-southeast-2 \
-  --parameter-overrides \
-    DeploymentBucket=YOUR-DEPLOYMENT-BUCKET \
-    SenderEmail=gluxford@gmail.com \
-    RecipientEmail=gluxford@gmail.com \
   --profile mymlpg
 ```
 
-### Step 4 — Verify your email address
-
-After the stack deploys, AWS SES sends a **verification email** to the address you supplied. Click the confirmation link in that email. The tool will not send emails until this step is complete.
-
-> **SES sandbox note:** New AWS accounts start in SES sandbox mode, which restricts sending to verified addresses only. For personal use this is fine. See [Moving out of SES sandbox](#moving-out-of-ses-sandbox) if you ever need to send to additional recipients.
-
-### Step 5 — Confirm the stack deployed correctly
-
-```bash
-aws cloudformation describe-stacks \
-  --stack-name aws-whats-new-summary-tool \
-  --region ap-southeast-2 \
-  --query "Stacks[0].Outputs" \
-  --profile mymlpg
-```
+Check your inbox and click the verification link. The tool will not send emails until this is done.
 
 ---
 
@@ -236,20 +242,12 @@ aws lambda invoke \
 
 ## Changing the schedule
 
-The default schedule is **daily at 03:00 AEST (17:00 UTC)**. To change it, redeploy with a new `ScheduleExpression`:
+The default schedule is **daily at 03:00 AEST (17:00 UTC)**. To change it, redeploy with a context override:
 
 ```bash
-aws cloudformation deploy \
-  --template-file cloudformation/template.yaml \
-  --stack-name aws-whats-new-summary-tool \
-  --capabilities CAPABILITY_NAMED_IAM \
-  --region ap-southeast-2 \
-  --parameter-overrides \
-    DeploymentBucket=YOUR-DEPLOYMENT-BUCKET \
-    SenderEmail=gluxford@gmail.com \
-    RecipientEmail=gluxford@gmail.com \
-    ScheduleExpression="cron(0 5,17 * * ? *)" \
-  --profile mymlpg
+cdk deploy \
+  --profile mymlpg \
+  --context schedule_expression="cron(0 5,17 * * ? *)"
 ```
 
 Cron reference — all times in UTC:
@@ -278,23 +276,17 @@ SES sandbox mode restricts sending to verified addresses only. For personal use 
 
 ## Teardown
 
-Delete the stack (the DynamoDB table is retained by default to preserve deduplication history):
-
 ```bash
-aws cloudformation delete-stack \
-  --stack-name aws-whats-new-summary-tool \
-  --region ap-southeast-2 \
-  --profile mymlpg
+cdk destroy --profile mymlpg
 ```
 
-To also remove the DynamoDB table after the stack is deleted:
-
-```bash
-aws dynamodb delete-table \
-  --table-name aws-whats-new-summary-tool-processed-announcements \
-  --region ap-southeast-2 \
-  --profile mymlpg
-```
+> The DynamoDB table is retained after destroy to preserve your deduplication history. To remove it manually:
+> ```bash
+> aws dynamodb delete-table \
+>   --table-name aws-whats-new-summary-tool-processed-announcements \
+>   --region ap-southeast-2 \
+>   --profile mymlpg
+> ```
 
 ---
 
@@ -302,13 +294,14 @@ aws dynamodb delete-table \
 
 ```
 aws-whats-new-summary-tool/
-├── cloudformation/
-│   └── template.yaml        # All AWS infrastructure
+├── cdk/
+│   ├── app.py           # CDK app entry point
+│   ├── stack.py         # All AWS infrastructure defined in Python
+│   ├── cdk.json         # CDK configuration
+│   └── requirements.txt # CDK Python dependencies
 ├── lambda/
-│   ├── handler.py           # Lambda function
-│   └── requirements.txt     # Python dependencies
-├── scripts/
-│   └── package.sh           # Build and upload Lambda ZIP
+│   ├── handler.py       # Lambda function
+│   └── requirements.txt # Lambda Python dependencies (boto3)
 ├── .gitignore
 └── README.md
 ```
