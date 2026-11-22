@@ -1,0 +1,270 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  AWS What's New Summary Tool.
+  Fetches the AWS What's New RSS feed on a schedule, summarises new
+  announcements using Amazon Bedrock Nova Lite, and emails the summary
+  via Amazon SES.
+
+# ---------------------------------------------------------------------------
+# Parameters
+# ---------------------------------------------------------------------------
+Parameters:
+
+  DeploymentBucket:
+    Type: String
+    Description: >
+      Name of an existing S3 bucket used to store the Lambda deployment
+      package. Created outside this stack (see README).
+
+  LambdaZipKey:
+    Type: String
+    Default: whats_new_summary.zip
+    Description: S3 object key of the Lambda deployment ZIP file.
+
+  SenderEmail:
+    Type: String
+    Description: >
+      Verified SES email address used as the From address.
+      Must be verified in SES before the stack can send email.
+
+  RecipientEmail:
+    Type: String
+    Description: >
+      Email address that will receive the summary.
+      Must be verified in SES while the account is in sandbox mode.
+
+  ScheduleExpression:
+    Type: String
+    Default: "cron(0 17 * * ? *)"
+    Description: >
+      EventBridge Scheduler cron expression (UTC).
+      Default is 17:00 UTC = 03:00 AEST (UTC+10).
+      Format: cron(Minutes Hours Day-of-month Month Day-of-week Year)
+
+  BedrockModelId:
+    Type: String
+    Default: amazon.nova-lite-v1:0
+    Description: Bedrock model ID used for summarisation.
+
+  MaxAnnouncements:
+    Type: Number
+    Default: 50
+    Description: >
+      Maximum number of RSS items to inspect per run. Increase during
+      high-volume periods such as re:Invent.
+
+  Environment:
+    Type: String
+    Default: production
+    AllowedValues: [production, staging]
+    Description: Deployment environment tag.
+
+# ---------------------------------------------------------------------------
+# Resources
+# ---------------------------------------------------------------------------
+Resources:
+
+  # ---- DynamoDB: processed-announcements tracking table ------------------
+
+  ProcessedAnnouncementsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Sub "${AWS::StackName}-processed-announcements"
+      BillingMode: PAY_PER_REQUEST
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+      AttributeDefinitions:
+        - AttributeName: guid
+          AttributeType: S
+      KeySchema:
+        - AttributeName: guid
+          KeyType: HASH
+      Tags:
+        - Key: Project
+          Value: aws-whats-new-summary-tool
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ---- IAM: Lambda execution role ----------------------------------------
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-lambda-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: WhatsNewSummaryPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+
+              # DynamoDB: read and write to the tracking table only
+              - Sid: DynamoDBAccess
+                Effect: Allow
+                Action:
+                  - dynamodb:Scan
+                  - dynamodb:BatchWriteItem
+                  - dynamodb:PutItem
+                Resource: !GetAtt ProcessedAnnouncementsTable.Arn
+
+              # Bedrock: invoke Nova Lite only
+              - Sid: BedrockInvoke
+                Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                Resource: !Sub "arn:aws:bedrock:${AWS::Region}::foundation-model/${BedrockModelId}"
+
+              # SES: send email only
+              - Sid: SESSendEmail
+                Effect: Allow
+                Action:
+                  - ses:SendEmail
+                  - ses:SendRawEmail
+                Resource: "*"
+
+      Tags:
+        - Key: Project
+          Value: aws-whats-new-summary-tool
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ---- Lambda: summary function ------------------------------------------
+
+  SummaryFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-summary"
+      Description: "Fetches AWS What's New RSS, summarises with Bedrock, emails via SES."
+      Runtime: python3.12
+      Handler: handler.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 300
+      MemorySize: 256
+      Code:
+        S3Bucket: !Ref DeploymentBucket
+        S3Key: !Ref LambdaZipKey
+      Environment:
+        Variables:
+          DYNAMODB_TABLE: !Ref ProcessedAnnouncementsTable
+          SES_SENDER: !Ref SenderEmail
+          SES_RECIPIENT: !Ref RecipientEmail
+          BEDROCK_MODEL_ID: !Ref BedrockModelId
+          MAX_ANNOUNCEMENTS: !Ref MaxAnnouncements
+      ReservedConcurrentExecutions: 1
+      Tags:
+        Project: aws-whats-new-summary-tool
+        Environment: !Ref Environment
+
+  # ---- CloudWatch Log Group (explicit, with retention) -------------------
+
+  SummaryFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${SummaryFunction}"
+      RetentionInDays: 30
+      Tags:
+        - Key: Project
+          Value: aws-whats-new-summary-tool
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ---- EventBridge Scheduler: daily at 03:00 AEST ------------------------
+
+  SchedulerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-scheduler-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: scheduler.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: InvokeLambda
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt SummaryFunction.Arn
+      Tags:
+        - Key: Project
+          Value: aws-whats-new-summary-tool
+        - Key: Environment
+          Value: !Ref Environment
+
+  DailySchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: !Sub "${AWS::StackName}-daily"
+      Description: "Daily AWS What's New summary — 03:00 AEST (17:00 UTC)"
+      ScheduleExpression: !Ref ScheduleExpression
+      ScheduleExpressionTimezone: "Australia/Sydney"
+      FlexibleTimeWindow:
+        Mode: "OFF"
+      Target:
+        Arn: !GetAtt SummaryFunction.Arn
+        RoleArn: !GetAtt SchedulerRole.Arn
+        Input: '{"source": "scheduled"}'
+      State: ENABLED
+
+  # ---- Lambda permission: allow EventBridge Scheduler to invoke ----------
+
+  LambdaSchedulerPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt SummaryFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: scheduler.amazonaws.com
+      SourceArn: !GetAtt DailySchedule.Arn
+
+  # ---- SES: email identity verification ----------------------------------
+  # Verifies the sender address. You will receive a confirmation email.
+
+  SESEmailIdentity:
+    Type: AWS::SES::EmailIdentity
+    Properties:
+      EmailIdentity: !Ref SenderEmail
+
+# ---------------------------------------------------------------------------
+# Outputs
+# ---------------------------------------------------------------------------
+Outputs:
+
+  LambdaFunctionName:
+    Description: Lambda function name (use this for on-demand invocation)
+    Value: !Ref SummaryFunction
+    Export:
+      Name: !Sub "${AWS::StackName}-FunctionName"
+
+  LambdaFunctionArn:
+    Description: Lambda function ARN
+    Value: !GetAtt SummaryFunction.Arn
+
+  DynamoDBTableName:
+    Description: DynamoDB tracking table name
+    Value: !Ref ProcessedAnnouncementsTable
+    Export:
+      Name: !Sub "${AWS::StackName}-TableName"
+
+  ScheduleName:
+    Description: EventBridge Scheduler schedule name
+    Value: !Ref DailySchedule
+
+  CloudWatchLogGroup:
+    Description: CloudWatch log group for Lambda logs
+    Value: !Ref SummaryFunctionLogGroup

@@ -1,0 +1,34 @@
+# Build artefacts
+.build/
+*.zip
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Python virtual environments
+.venv/
+venv/
+env/
+
+# AWS SAM / CDK
+.aws-sam/
+cdk.out/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Local environment / secrets — never commit these
+.env
+.env.*
+*.pem
+credentials
