@@ -87,10 +87,26 @@ class WhatsNewSummaryStack(Stack):
 
         # ---- Lambda: summary function ------------------------------------
 
-        sender_email = self.node.try_get_context("sender_email") or "gluxford@gmail.com"
-        recipient_email = self.node.try_get_context("recipient_email") or "gluxford@gmail.com"
-        bedrock_model_id = self.node.try_get_context("bedrock_model_id") or "amazon.nova-lite-v1:0"
-        max_announcements = self.node.try_get_context("max_announcements") or "50"
+        # Settings come from environment variables (normally loaded from
+        # config.env by scripts/deploy.sh). A --context value overrides them.
+        def setting(context_key: str, env_key: str, default: str = "") -> str:
+            return str(
+                self.node.try_get_context(context_key)
+                or os.environ.get(env_key)
+                or default
+            )
+
+        recipient_email = setting("recipient_email", "RECIPIENT_EMAIL")
+        sender_email = setting("sender_email", "SENDER_EMAIL", recipient_email)
+        if not recipient_email:
+            raise ValueError(
+                "RECIPIENT_EMAIL is not set. Copy config.env.example to "
+                "config.env, fill in your values, and deploy with "
+                "./scripts/deploy.sh"
+            )
+        bedrock_model_id = setting("bedrock_model_id", "BEDROCK_MODEL_ID", "amazon.nova-lite-v1:0")
+        max_announcements = setting("max_announcements", "MAX_ANNOUNCEMENTS", "50")
+        schedule_expression = setting("schedule_expression", "SCHEDULE_EXPRESSION", "cron(0 17 * * ? *)")
 
         fn = lambda_.Function(
             self,
@@ -100,7 +116,7 @@ class WhatsNewSummaryStack(Stack):
             runtime=lambda_.Runtime.PYTHON_3_12,
             handler="handler.lambda_handler",
             code=lambda_.Code.from_asset(
-                os.path.join(os.path.dirname(__file__), "lambda"),
+                os.path.join(os.path.dirname(__file__), "..", "lambda"),
                 bundling={
                     "image": lambda_.Runtime.PYTHON_3_12.bundling_image,
                     "command": [
@@ -138,18 +154,13 @@ class WhatsNewSummaryStack(Stack):
             )
         )
 
-        # ---- EventBridge Scheduler: daily 03:00 AEST (17:00 UTC) --------
-
-        schedule_expression = (
-            self.node.try_get_context("schedule_expression")
-            or "cron(0 17 * * ? *)"
-        )
+        # ---- EventBridge Scheduler (default: daily 17:00 UTC = 03:00 AEST) -
 
         cfn_schedule = scheduler.CfnSchedule(
             self,
             "DailySchedule",
             name=f"{construct_id}-daily",
-            description="Daily AWS What's New summary - 03:00 AEST (17:00 UTC)",
+            description=f"AWS What's New summary, schedule {schedule_expression} (UTC)",
             schedule_expression=schedule_expression,
             flexible_time_window=scheduler.CfnSchedule.FlexibleTimeWindowProperty(
                 mode="OFF",
