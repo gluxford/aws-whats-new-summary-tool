@@ -6,9 +6,11 @@ last run, summarises each using Amazon Bedrock Nova Lite, and emails the
 summary via Amazon SES.
 """
 
+import html
 import json
 import os
 import hashlib
+import re
 import urllib.request
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
@@ -122,25 +124,52 @@ SYSTEM_PROMPT = (
 )
 
 
-def summarise_announcements(items: list[dict]) -> list[dict]:
+def clean_text(raw: str) -> str:
+    """Remove HTML tags and entities from RSS text and collapse whitespace."""
+    text = re.sub(r"<[^>]+>", " ", raw)
+    text = html.unescape(text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def trim_to_sentence(text: str, max_chars: int = 600) -> str:
     """
-    Call Bedrock Nova Lite to summarise each announcement individually.
-    Returns the original item dicts with a 'summary' key added.
+    Shorten text to at most max_chars, ending on a complete sentence.
+    If no sentence ends within the limit, end on a whole word instead.
+    """
+    if len(text) <= max_chars and re.search(r"[.!?]$", text):
+        return text
+    window = text[:max_chars]
+    sentence_ends = [m.end() for m in re.finditer(r"[.!?](?=\s|$)", window)]
+    if sentence_ends:
+        return window[: sentence_ends[-1]].strip()
+    if len(text) <= max_chars:
+        return text
+    return window.rsplit(" ", 1)[0].rstrip(",;:") + "..."
+
+
+def summarise_announcements(items: list[dict]) -> tuple[list[dict], int]:
+    """
+    Call Bedrock to summarise each announcement individually.
+    Returns the items with a 'summary' key added, and the number of
+    announcements Bedrock failed to summarise.
     """
     summarised = []
+    failures = 0
 
     for item in items:
+        description = clean_text(item["description"])
         user_message = (
             f"Title: {item['title']}\n\n"
-            f"Description: {item['description']}\n\n"
+            f"Description: {description}\n\n"
             "Write a 2-3 sentence summary of this announcement."
         )
 
+        # Nova models require content to be a list of content blocks.
         payload = {
-            "messages": [{"role": "user", "content": user_message}],
+            "messages": [{"role": "user", "content": [{"text": user_message}]}],
             "system": [{"text": SYSTEM_PROMPT}],
             "inferenceConfig": {
-                "maxTokens": 150,
+                "maxTokens": 300,
                 "temperature": 0.3,
             },
         }
@@ -154,13 +183,16 @@ def summarise_announcements(items: list[dict]) -> list[dict]:
             )
             result = json.loads(response["body"].read())
             summary = result["output"]["message"]["content"][0]["text"].strip()
-        except ClientError as exc:
+            if result.get("stopReason") == "max_tokens":
+                summary = trim_to_sentence(summary)
+        except (ClientError, KeyError, IndexError, ValueError) as exc:
+            failures += 1
             print(f"Bedrock error for '{item['title']}': {exc}")
-            summary = item["description"][:300] + "..."
+            summary = trim_to_sentence(description)
 
         summarised.append({**item, "summary": summary})
 
-    return summarised
+    return summarised, failures
 
 
 # ---------------------------------------------------------------------------
@@ -202,13 +234,17 @@ def build_email(items: list[dict], run_time: str) -> tuple[str, str, str]:
     text_body = "\n".join(text_lines)
 
     # --- HTML (table-based for email client compatibility) ---
+    # Feed text is escaped so it cannot inject markup into the email.
     html_items = ""
     for idx, item in enumerate(items, start=1):
+        title = html.escape(item["title"])
+        summary = html.escape(item["summary"])
+        link = html.escape(item["link"], quote=True)
         html_items += (
             '<div style="margin-bottom:28px;padding-bottom:20px;border-bottom:1px solid #e0e0e0;">'
-            f'<h3 style="margin:0 0 6px 0;font-size:16px;color:#232f3e;">{idx}. {item["title"]}</h3>'
-            f'<p style="margin:0 0 10px 0;color:#333;line-height:1.6;">{item["summary"]}</p>'
-            f'<a href="{item["link"]}" style="color:#ff9900;font-weight:bold;text-decoration:none;">'
+            f'<h3 style="margin:0 0 6px 0;font-size:16px;color:#232f3e;">{idx}. {title}</h3>'
+            f'<p style="margin:0 0 10px 0;color:#333;line-height:1.6;">{summary}</p>'
+            f'<a href="{link}" style="color:#ff9900;font-weight:bold;text-decoration:none;">'
             "Read the full announcement &rarr;</a>"
             "</div>\n"
         )
@@ -280,8 +316,18 @@ def lambda_handler(event, context):
         return {"statusCode": 200, "body": "No new announcements."}
 
     # 3. Summarise with Bedrock
-    print("Summarising with Amazon Bedrock Nova Lite...")
-    summarised = summarise_announcements(new_items)
+    print(f"Summarising with Amazon Bedrock ({BEDROCK_MODEL_ID})...")
+    summarised, failures = summarise_announcements(new_items)
+    print(f"Bedrock summarised {len(new_items) - failures} of {len(new_items)} items.")
+
+    # If every call failed, Bedrock is broken (permissions, model access,
+    # request format). Fail the run without emailing or marking anything
+    # processed, so the next run retries these announcements.
+    if failures == len(new_items):
+        raise RuntimeError(
+            f"Bedrock failed for all {failures} announcements. "
+            "No email sent; the items will be retried on the next run."
+        )
 
     # 4. Build and send email
     subject, html_body, text_body = build_email(summarised, run_time)
