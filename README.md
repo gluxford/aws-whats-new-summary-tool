@@ -339,6 +339,10 @@ aws-whats-new-summary-tool/
 
 Pull requests are welcome. Please open an issue first to discuss significant changes.
 
+The `main` branch is protected. Every change goes through a pull request and needs approval from the code owner listed in `.github/CODEOWNERS`. Force pushes and branch deletion are blocked.
+
+If you fork this repository and want the same protection, import `.github/rulesets/protect-main.json` under **Settings → Rules → Rulesets → New ruleset → Import a ruleset**, and change the owner in `.github/CODEOWNERS` to your GitHub username.
+
 ## Licence
 
 [MIT](https://opensource.org/licenses/MIT)
